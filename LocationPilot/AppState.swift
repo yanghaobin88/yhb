@@ -39,6 +39,17 @@ final class AppState: ObservableObject {
         static let host = "lp.server.host"
         static let port = "lp.server.port"
         static let favorites = "lp.favorites"
+        static let engineMode = "lp.engine.mode"
+    }
+
+    // MARK: - 注入引擎
+
+    /// 定位注入走哪条路：本机注入（默认，不需要电脑）或 Mac 桥接
+    @Published var engineMode: EngineMode {
+        didSet {
+            UserDefaults.standard.set(engineMode.rawValue, forKey: Keys.engineMode)
+            log("注入模式已切换为：\(engineMode.label)", level: .info)
+        }
     }
 
     // MARK: - 服务器配置
@@ -93,6 +104,7 @@ final class AppState: ObservableObject {
         let savedPort = defaults.string(forKey: Keys.port) ?? "8765"
         self.host = savedHost
         self.port = savedPort
+        self.engineMode = EngineMode(rawValue: defaults.string(forKey: Keys.engineMode) ?? "") ?? .native
         loadFavorites()
         log("App 已启动，服务器地址：\(baseAddressText)", level: .info)
     }
@@ -105,11 +117,17 @@ final class AppState: ObservableObject {
     }
 
     var baseAddressText: String {
-        LocServerClient.displayAddress(host: host, port: port)
+        switch engineMode {
+        case .native: return "本机注入（无需 Mac）"
+        case .remote: return LocServerClient.displayAddress(host: host, port: port)
+        }
     }
 
     var hasServerConfigured: Bool {
-        baseURL != nil
+        switch engineMode {
+        case .native: return true
+        case .remote: return baseURL != nil
+        }
     }
 
     /// 当前设备是否就绪（有设备、通道支持、开发者模式没被明确关掉）
@@ -124,7 +142,11 @@ final class AppState: ObservableObject {
     var statusSummary: String {
         if let device = selectedDevice {
             let version = device.ios ?? "未知版本"
-            return "\(device.displayName) · iOS \(version) · \(device.connection ?? "未知连接")"
+            let channel = device.channelLabel ?? device.connection ?? "未知连接"
+            return "\(device.displayName) · iOS \(version) · \(channel)"
+        }
+        if engineMode == .native {
+            return "本机注入已就绪（不需要电脑）"
         }
         switch connection {
         case .online: return "服务已连接，但未检测到 iPhone"
@@ -139,11 +161,16 @@ final class AppState: ObservableObject {
 
     // MARK: - 客户端
 
-    private func makeClient() throws -> LocServerClient {
-        guard let url = baseURL else {
-            throw LocServerError("服务器地址不合法，请到「设置」填写 Mac 的局域网 IP 与端口。")
+    private func makeEngine() throws -> any LocationEngine {
+        switch engineMode {
+        case .native:
+            return NativeEngine()
+        case .remote:
+            guard let url = baseURL else {
+                throw LocServerError("服务器地址不合法，请到「设置」填写 Mac 的局域网 IP 与端口，或切回「本机注入」。")
+            }
+            return LocServerClient(baseURL: url)
         }
-        return LocServerClient(baseURL: url)
     }
 
     // MARK: - 日志
@@ -186,23 +213,27 @@ final class AppState: ObservableObject {
     @discardableResult
     func testConnection() async -> Bool {
         busy = true
-        busyText = "正在连接 Mac 服务…"
+        busyText = engineMode == .native ? "正在检查本机注入接口…" : "正在连接 Mac 服务…"
         defer {
             busy = false
             busyText = ""
         }
         do {
-            let client = try makeClient()
-            let result = try await client.health()
+            let engine = try makeEngine()
+            let result = try await engine.health()
             health = result
             connection = .online
-            log("已连接 locserver \(result.version)（Python \(result.python)，监听 \(result.host):\(result.port)）",
-                level: .success)
+            log("\(result.service) \(result.version)：\(result.python)", level: .success)
             if !result.dependenciesReady {
-                log("注意：服务端依赖未就绪，注入会失败。请在 Mac 上双击「启动.command」完成安装。",
-                    level: .failure)
+                if engineMode == .native {
+                    log("注入接口不可用：\(result.python)。请确认本 App 是用 TrollStore 安装，且保留了 com.apple.locationd.simulation 权限。",
+                        level: .failure)
+                } else {
+                    log("注意：服务端依赖未就绪，注入会失败。请在 Mac 上双击「启动.command」完成安装。",
+                        level: .failure)
+                }
             }
-            await loadStatus(using: client, silently: true)
+            await loadStatus(using: engine, silently: true)
             return true
         } catch {
             health = nil
@@ -216,17 +247,17 @@ final class AppState: ObservableObject {
     @discardableResult
     func refreshStatus() async -> Bool {
         do {
-            let client = try makeClient()
-            return await loadStatus(using: client, silently: false)
+            let engine = try makeEngine()
+            return await loadStatus(using: engine, silently: false)
         } catch {
             markError(error)
             return false
         }
     }
 
-    private func loadStatus(using client: LocServerClient, silently: Bool) async -> Bool {
+    private func loadStatus(using engine: any LocationEngine, silently: Bool) async -> Bool {
         do {
-            let data = try await client.status()
+            let data = try await engine.status()
             status = data
             session = data.session
             devices = data.devices ?? []
@@ -251,8 +282,8 @@ final class AppState: ObservableObject {
     /// 只刷新会话状态（轻量，用于注入后回显）
     func refreshSession() async {
         do {
-            let client = try makeClient()
-            session = try await client.session()
+            let engine = try makeEngine()
+            session = try await engine.session()
         } catch {
             // 会话查询失败不打扰用户，只记日志
             log("查询会话状态失败：\((error as? LocServerError)?.message ?? error.localizedDescription)",
@@ -270,8 +301,8 @@ final class AppState: ObservableObject {
             busyText = ""
         }
         do {
-            let client = try makeClient()
-            let data = try await client.devices()
+            let engine = try makeEngine()
+            let data = try await engine.devices()
             devices = data.devices ?? []
             selectedDevice = data.device
             connection = .online
@@ -293,8 +324,8 @@ final class AppState: ObservableObject {
             busyText = ""
         }
         do {
-            let client = try makeClient()
-            let data = try await client.selectDevice(udid: device.udid)
+            let engine = try makeEngine()
+            let data = try await engine.selectDevice(udid: device.udid)
             selectedDevice = data.device ?? device
             markSuccess(data.message ?? "已切换目标设备")
             await refreshStatus()
@@ -313,8 +344,8 @@ final class AppState: ObservableObject {
             busyText = ""
         }
         do {
-            let client = try makeClient()
-            let data = try await client.inspect()
+            let engine = try makeEngine()
+            let data = try await engine.inspect()
             inspect = data
             markSuccess("诊断完成：\(data.channelLabel ?? "通道未知")")
         } catch {
@@ -330,8 +361,8 @@ final class AppState: ObservableObject {
             busyText = ""
         }
         do {
-            let client = try makeClient()
-            let data = try await client.mountDeveloperImage()
+            let engine = try makeEngine()
+            let data = try await engine.mountDeveloperImage()
             markSuccess(data.message ?? "开发者镜像已就绪")
             await runInspect()
         } catch {
@@ -343,8 +374,8 @@ final class AppState: ObservableObject {
 
     func loadPresets() async {
         do {
-            let client = try makeClient()
-            presets = try await client.presets().presets
+            let engine = try makeEngine()
+            presets = try await engine.presets().presets
         } catch {
             log("读取内置预设失败：\((error as? LocServerError)?.message ?? error.localizedDescription)",
                 level: .info)
@@ -367,8 +398,8 @@ final class AppState: ObservableObject {
             busyText = ""
         }
         do {
-            let client = try makeClient()
-            let data = try await client.setLocation(lat: point.lat,
+            let engine = try makeEngine()
+            let data = try await engine.setLocation(lat: point.lat,
                                                     lng: point.lng,
                                                     name: name,
                                                     udid: selectedDevice?.udid)
@@ -392,8 +423,8 @@ final class AppState: ObservableObject {
             busyText = ""
         }
         do {
-            let client = try makeClient()
-            let data = try await client.clearLocation()
+            let engine = try makeEngine()
+            let data = try await engine.clearLocation()
             markSuccess(data.message)
             await refreshSession()
             return data.cleared
@@ -415,8 +446,8 @@ final class AppState: ObservableObject {
             busyText = ""
         }
         do {
-            let client = try makeClient()
-            let data = try await client.search(query: keyword, limit: limit)
+            let engine = try makeEngine()
+            let data = try await engine.search(query: keyword, limit: limit)
             let results = data.results ?? []
             if results.isEmpty {
                 log("「\(keyword)」没有搜到结果，换个说法或加上城市名试试。", level: .info)
@@ -444,8 +475,8 @@ final class AppState: ObservableObject {
             busyText = ""
         }
         do {
-            let client = try makeClient()
-            let data = try await client.planRoute(start: start, end: end, mode: mode, pace: pace)
+            let engine = try makeEngine()
+            let data = try await engine.planRoute(start: start, end: end, mode: mode, pace: pace)
             routes = data.routes
             if routes.isEmpty {
                 markError(LocServerError("没有规划出可用路线，请调整起终点后重试。"))
@@ -466,8 +497,8 @@ final class AppState: ObservableObject {
             busyText = ""
         }
         do {
-            let client = try makeClient()
-            let data = try await client.playRoute(points: option.points,
+            let engine = try makeEngine()
+            let data = try await engine.playRoute(points: option.points,
                                                   mode: mode,
                                                   pace: pace,
                                                   name: option.summary.isEmpty ? "路线回放" : option.summary)
@@ -491,8 +522,8 @@ final class AppState: ObservableObject {
             busyText = ""
         }
         do {
-            let client = try makeClient()
-            let data = try await client.playRoute(start: start, end: end, mode: mode, pace: pace)
+            let engine = try makeEngine()
+            let data = try await engine.playRoute(start: start, end: end, mode: mode, pace: pace)
             markSuccess(data.message)
             await refreshSession()
         } catch {
@@ -508,8 +539,8 @@ final class AppState: ObservableObject {
             busyText = ""
         }
         do {
-            let client = try makeClient()
-            let data = try await client.stopRoute()
+            let engine = try makeEngine()
+            let data = try await engine.stopRoute()
             markSuccess(data.message)
             await refreshSession()
         } catch {
@@ -561,7 +592,14 @@ final class AppState: ObservableObject {
 
     /// 首屏自动跑一次：有地址就连接，没地址就提示去设置页
     func bootstrap() async {
-        if hasServerConfigured {
+        if engineMode == .native {
+            let device = NativeEngine.localDevice()
+            selectedDevice = device
+            devices = [device]
+            log("本机注入模式启动：不连电脑，直接改写本机定位。", level: .info)
+            await testConnection()
+            await loadPresets()
+        } else if hasServerConfigured {
             await testConnection()
             await loadPresets()
         } else {

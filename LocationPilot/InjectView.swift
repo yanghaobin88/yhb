@@ -160,7 +160,9 @@ struct InjectView: View {
 
     private var presetCard: some View {
         Card(title: "内置预设地点",
-             subtitle: "来自 Mac 端 iosloc.py 的 PRESETS 常量，点一下即注入。",
+             subtitle: app.engineMode == .native
+                ? "打包在 App 里的常用地点，离线可用，点一下即注入。"
+                : "来自 Mac 端 iosloc.py 的 PRESETS 常量，点一下即注入。",
              systemImage: "mappin.circle.fill") {
             if app.presets.isEmpty {
                 EmptyHintView(text: app.hasServerConfigured

@@ -1,4 +1,4 @@
-name: Build Unsigned IPA
+name: Build IPA (unsigned + TrollStore)
 
 on:
   push:
@@ -64,7 +64,13 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-      - name: Package into .ipa
+      - name: Install ldid
+        if: success()
+        run: |
+          brew install ldid
+          ldid -v || true
+
+      - name: Package unsigned .ipa and TrollStore .tipa
         if: success()
         run: |
           set -euo pipefail
@@ -74,34 +80,58 @@ jobs:
             find build/Build/Products -maxdepth 3 -name "*.app" -print
             exit 1
           fi
+
+          ENT="$GITHUB_WORKSPACE/LocationPilot.entitlements"
+          test -f "$ENT" || { echo "::error::缺少 LocationPilot.entitlements"; exit 1; }
+
+          # ---------- 1) 未签名 ipa（通用兜底） ----------
           mkdir -p out/Payload
           cp -R "$APP_PATH" out/Payload/
-          cd out
-          zip -qry LocationPilot.ipa Payload
-          ls -lh LocationPilot.ipa
+          ( cd out && zip -qry LocationPilot-unsigned.ipa Payload )
 
-      - name: Publish IPA to Release
+          # ---------- 2) TrollStore 签名版（注入 locationd.simulation 权限） ----------
+          mkdir -p troll/Payload
+          cp -R "$APP_PATH" troll/Payload/
+          BIN="troll/Payload/LocationPilot.app/LocationPilot"
+          ldid -S"$ENT" "$BIN"
+          echo "----- 已写入的 entitlements -----"
+          ldid -e "$BIN"
+          if ldid -e "$BIN" | grep -q "locationd.simulation"; then
+            echo "OK: com.apple.locationd.simulation 已注入"
+          else
+            echo "::error title=entitlements::ldid 未能写入 com.apple.locationd.simulation"
+            exit 1
+          fi
+          # 顺手把 entitlements 放进包里，方便排查
+          cp "$ENT" "troll/Payload/LocationPilot.app/LocationPilot.entitlements"
+          ( cd troll && zip -qry LocationPilot.tipa Payload )
+
+          ls -lh out/LocationPilot-unsigned.ipa troll/LocationPilot.tipa
+
+      - name: Publish to Release
         if: success()
         uses: softprops/action-gh-release@v2
         with:
           tag_name: build-${{ github.run_number }}
-          name: LocationPilot unsigned ipa #${{ github.run_number }}
+          name: LocationPilot build #${{ github.run_number }}
           prerelease: true
-          files: out/LocationPilot.ipa
+          files: |
+            out/LocationPilot-unsigned.ipa
+            troll/LocationPilot.tipa
 
-      - name: Publish IPA (base64) to dist branch
+      - name: Publish tipa (base64) to dist branch
         if: success()
         run: |
           set -euo pipefail
-          base64 -i out/LocationPilot.ipa | tr -d '\n' > /tmp/LocationPilot.ipa.b64
-          ls -lh /tmp/LocationPilot.ipa.b64
+          base64 -i troll/LocationPilot.tipa | tr -d '\n' > /tmp/LocationPilot.tipa.b64
+          ls -lh /tmp/LocationPilot.tipa.b64
           git fetch origin dist || true
           git worktree add /tmp/distwt --detach
           cd /tmp/distwt
           git checkout --orphan distnew
           git rm -rf . -q || true
           mkdir -p dist
-          cp /tmp/LocationPilot.ipa.b64 dist/LocationPilot.ipa.b64
-          git add -f dist/LocationPilot.ipa.b64
-          git -c user.name=actions -c user.email=actions@github.com commit -q -m "ipa base64 build ${{ github.run_number }}"
+          cp /tmp/LocationPilot.tipa.b64 dist/LocationPilot.tipa.b64
+          git add -f dist/LocationPilot.tipa.b64
+          git -c user.name=actions -c user.email=actions@github.com commit -q -m "tipa base64 build ${{ github.run_number }}"
           git push -f origin HEAD:dist

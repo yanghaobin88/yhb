@@ -25,18 +25,57 @@ struct SettingsView: View {
 
     var body: some View {
         Form {
-            serverSection
+            engineSection
+            if app.engineMode == .remote {
+                serverSection
+            }
             healthSection
             deviceSection
             diagnoseSection
             logSection
             aboutSection
         }
+        .onChange(of: app.engineMode) { _, _ in
+            Task { await app.bootstrap() }
+        }
         .onAppear {
             guard !loaded else { return }
             loaded = true
             hostDraft = app.host
             portDraft = app.port
+        }
+    }
+
+    // MARK: - 注入方式
+
+    private var engineSection: some View {
+        Section {
+            Picker("注入方式", selection: $app.engineMode) {
+                ForEach(EngineMode.allCases) { mode in
+                    Text(mode.label).tag(mode)
+                }
+            }
+            .pickerStyle(.inline)
+
+            HStack(alignment: .top, spacing: 6) {
+                Image(systemName: app.engineMode.iconName)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .padding(.top, 1)
+                Text(app.engineMode.detail)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if let session = app.session {
+                KeyValueRow(title: "会话", value: session.stateText,
+                            valueColor: session.healthy ? .green : .orange)
+            }
+        } header: {
+            Text("注入方式")
+        } footer: {
+            Text("「本机注入」不连电脑：App 直接调用系统私有 CLSimulationManager 改写 locationd。该接口需要 com.apple.locationd.simulation 权限，只有 TrollStore 安装（ldid -S 注入 entitlements）才生效；普通签名下会静默失效。")
         }
     }
 
@@ -242,12 +281,14 @@ struct SettingsView: View {
                 }
             }
 
-            Button {
-                Task { await app.mountDeveloperImage() }
-            } label: {
-                Label("挂载开发者镜像", systemImage: "externaldrive.badge.plus")
+            if app.engineMode == .remote {
+                Button {
+                    Task { await app.mountDeveloperImage() }
+                } label: {
+                    Label("挂载开发者镜像", systemImage: "externaldrive.badge.plus")
+                }
+                .font(.footnote)
             }
-            .font(.footnote)
         } header: {
             Text("前置条件")
         } footer: {
@@ -276,18 +317,31 @@ struct SettingsView: View {
     private var aboutSection: some View {
         Section {
             VStack(alignment: .leading, spacing: 6) {
-                Text("使用步骤")
+                Text("使用步骤 · \(app.engineMode.label)")
                     .font(.footnote.weight(.semibold))
-                Text("1. Mac 上双击「启动 locserver.command」，等待终端打印地址。")
-                    .font(.caption)
-                Text("2. 用数据线连接 iPhone，手机上点「信任此电脑」。")
-                    .font(.caption)
-                Text("3. 在本页填写 Mac 的 IP 与端口，点「保存并测试连接」。")
-                    .font(.caption)
-                Text("4. 回到「注入」页输入坐标或点预设；「地图」页可以直接点图选点。")
-                    .font(.caption)
-                Text("5. 需要恢复真实位置时，点「清除定位」或直接拔掉数据线重启定位服务。")
-                    .font(.caption)
+                if app.engineMode == .native {
+                    Text("1. 用 TrollStore 安装 ipa（保留 App 内置 entitlements）。")
+                        .font(.caption)
+                    Text("2. 打开 App，本页点「测试连接」，看到「注入接口已就绪」即为正常。")
+                        .font(.caption)
+                    Text("3. 在「注入」页输入坐标或点预设；「地图」页可以直接点图选点。")
+                        .font(.caption)
+                    Text("4. 点「诊断前置条件」会真采样验证一次，确认蓝点是否被改写。")
+                        .font(.caption)
+                    Text("5. 需要恢复真实位置时，点「清除定位」。")
+                        .font(.caption)
+                } else {
+                    Text("1. Mac 上双击「启动 locserver.command」，等待终端打印地址。")
+                        .font(.caption)
+                    Text("2. 用数据线连接 iPhone，手机上点「信任此电脑」。")
+                        .font(.caption)
+                    Text("3. 在本页填写 Mac 的 IP 与端口，点「保存并测试连接」。")
+                        .font(.caption)
+                    Text("4. 回到「注入」页输入坐标或点预设；「地图」页可以直接点图选点。")
+                        .font(.caption)
+                    Text("5. 需要恢复真实位置时，点「清除定位」或直接拔掉数据线重启定位服务。")
+                        .font(.caption)
+                }
             }
             .foregroundStyle(.primary)
 
@@ -297,7 +351,7 @@ struct SettingsView: View {
         } header: {
             Text("关于")
         } footer: {
-            Text("本 App 只连接你局域网内的 Mac，不经过任何云端服务器，不会上传坐标与设备信息。")
+            Text("本机注入模式下所有坐标都只在你手机上处理，不经过任何服务器；Mac 桥接模式下也只走局域网，不上传云端。")
         }
     }
 
