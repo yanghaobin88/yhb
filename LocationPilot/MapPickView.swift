@@ -82,7 +82,7 @@ struct MapPickView: View {
                         .stroke(Color.gray.opacity(0.6), style: StrokeStyle(lineWidth: 2, dash: [6, 5]))
                 }
             }
-            .mapStyle(.standard(elevation: .flat, pointsOfInterest: .including([.cafe, .restaurant, .park, .subwayStation])))
+            .mapStyle(.standard(elevation: .flat, pointsOfInterest: .including([.cafe, .restaurant, .park, .publicTransport])))
             .onTapGesture { screenPoint in
                 if let coordinate = proxy.convert(screenPoint, from: .local) {
                     app.pickedPoint = GeoPoint(coordinate)
