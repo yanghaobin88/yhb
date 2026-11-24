@@ -63,7 +63,6 @@ struct NativeEngine: LocationEngine {
         let injector = await NativeInjector.shared
         let ready = await injector.available
         let report = await injector.probeReport
-        let activeName = await injector.activeName
         let activePoint = await injector.activePoint
 
         var hints: [String] = []
@@ -334,7 +333,7 @@ struct NativeEngine: LocationEngine {
     static func transportType(for mode: TravelMode) -> MKDirectionsTransportType {
         switch mode {
         case .walking: return .walking
-        case .cycling: return .cycling
+        case .cycling: return .automobile   // MapKit 没有骑行路网，用驾车路网近似
         case .driving: return .automobile
         }
     }
@@ -359,7 +358,10 @@ struct NativeEngine: LocationEngine {
     static func sample(points polyline: MKPolyline, limit: Int = 400) -> [GeoPoint] {
         let count = polyline.pointCount
         guard count > 0 else { return [] }
-        let buffer = polyline.coordinates
+        var coordinates = [CLLocationCoordinate2D](repeating: kCLLocationCoordinate2DInvalid,
+                                                   count: count)
+        polyline.getCoordinates(&coordinates, range: NSRange(location: 0, length: count))
+        let buffer = coordinates
         let step = max(1, count / max(1, limit))
         var result: [GeoPoint] = []
         var index = 0
