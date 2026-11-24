@@ -5,6 +5,9 @@ on:
     branches: [ main, master ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: macos-15
@@ -16,14 +19,13 @@ jobs:
 
       - name: Show Xcode version
         run: |
-          ls /Applications | grep -i xcode || true
           sudo xcode-select -s /Applications/Xcode.app 2>/dev/null || true
           xcodebuild -version
           xcodebuild -showsdks | grep -i iphone || true
 
       - name: Build unsigned .app
         run: |
-          set -euo pipefail
+          set -o pipefail
           xcodebuild \
             -project LocationPilot.xcodeproj \
             -scheme LocationPilot \
@@ -37,9 +39,29 @@ jobs:
             CODE_SIGN_ENTITLEMENTS="" \
             ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS=NO \
             ENABLE_BITCODE=NO \
-            build
+            build 2>&1 | tee build.log
+          st=${PIPESTATUS[0]}
+          if [ "$st" -ne 0 ]; then
+            echo "===== BUILD FAILED (exit $st) ====="
+            grep -nE "error: |fatal error|Undefined symbols|\.app: error" build.log | head -25 | while IFS= read -r line; do
+              echo "::error title=xcodebuild::$line"
+            done
+            echo "===== TAIL 80 ====="
+            tail -n 80 build.log
+          fi
+          exit "$st"
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Package into .ipa
+        if: success()
         run: |
           set -euo pipefail
           APP_PATH="build/Build/Products/Release-iphoneos/LocationPilot.app"
@@ -48,18 +70,17 @@ jobs:
             find build/Build/Products -maxdepth 3 -name "*.app" -print
             exit 1
           fi
-          rm -rf out
           mkdir -p out/Payload
           cp -R "$APP_PATH" out/Payload/
           cd out
           zip -qry LocationPilot.ipa Payload
           ls -lh LocationPilot.ipa
-          unzip -l LocationPilot.ipa | head -20
 
-      - name: Upload IPA artifact
-        uses: actions/upload-artifact@v4
+      - name: Publish IPA to Release
+        if: success()
+        uses: softprops/action-gh-release@v2
         with:
-          name: LocationPilot-ipa
-          path: out/LocationPilot.ipa
-          if-no-files-found: error
-          retention-days: 30
+          tag_name: build-${{ github.run_number }}
+          name: LocationPilot unsigned ipa #${{ github.run_number }}
+          prerelease: true
+          files: out/LocationPilot.ipa
