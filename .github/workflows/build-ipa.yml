@@ -88,3 +88,20 @@ jobs:
           name: LocationPilot unsigned ipa #${{ github.run_number }}
           prerelease: true
           files: out/LocationPilot.ipa
+
+      - name: Publish IPA (base64) to dist branch
+        if: success()
+        run: |
+          set -euo pipefail
+          base64 -i out/LocationPilot.ipa | tr -d '\n' > /tmp/LocationPilot.ipa.b64
+          ls -lh /tmp/LocationPilot.ipa.b64
+          git fetch origin dist || true
+          git worktree add /tmp/distwt --detach
+          cd /tmp/distwt
+          git checkout --orphan distnew
+          git rm -rf . -q || true
+          mkdir -p dist
+          cp /tmp/LocationPilot.ipa.b64 dist/LocationPilot.ipa.b64
+          git add -f dist/LocationPilot.ipa.b64
+          git -c user.name=actions -c user.email=actions@github.com commit -q -m "ipa base64 build ${{ github.run_number }}"
+          git push -f origin HEAD:dist
