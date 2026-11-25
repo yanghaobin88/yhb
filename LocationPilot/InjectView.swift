@@ -15,6 +15,8 @@ struct InjectView: View {
     @State private var nameText: String = ""
     @State private var showClearConfirm = false
     @State private var lastResult: SetLocationData?
+    @State private var diagnosing = false
+    @State private var diagnosisReport: String?
 
     private var coordinatePreview: String {
         if let point = Format.parseCoordinate(lat: latText, lng: lngText) {
@@ -62,6 +64,14 @@ struct InjectView: View {
             }
         } message: {
             Text("清除后设备会恢复真实 GPS 位置，之前注入的坐标将失效。")
+        }
+        .alert("本机注入自检", isPresented: Binding(
+            get: { diagnosisReport != nil },
+            set: { if !$0 { diagnosisReport = nil } }
+        )) {
+            Button("好", role: .cancel) { diagnosisReport = nil }
+        } message: {
+            Text(diagnosisReport ?? "")
         }
     }
 
@@ -300,6 +310,26 @@ struct InjectView: View {
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.bordered)
+
+                Button {
+                    Task {
+                        diagnosing = true
+                        let result = await NativeInjector.shared.diagnose()
+                        diagnosisReport = (result.passed ? "自检通过\n\n" : "自检未通过\n\n") + result.report
+                        diagnosing = false
+                    }
+                } label: {
+                    if diagnosing {
+                        ProgressView()
+                            .controlSize(.small)
+                            .frame(maxWidth: .infinity)
+                    } else {
+                        Label("注入自检", systemImage: "checklist")
+                            .frame(maxWidth: .infinity)
+                    }
+                }
+                .buttonStyle(.bordered)
+                .disabled(diagnosing)
 
                 if app.selectedDevice?.needDeveloperImage == true {
                     Button {

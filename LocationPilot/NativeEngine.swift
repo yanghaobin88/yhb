@@ -254,7 +254,10 @@ struct NativeEngine: LocationEngine {
         let totalSeconds = Self.totalSeconds(pace: pace, distance: distance, nativeDuration: nil)
         let interval = max(0.05, totalSeconds / Double(points.count - 1))
 
-        await RoutePlayer.shared.start(points: points, interval: interval, name: name ?? "路线回放")
+        let outcome = await RoutePlayer.shared.start(points: points, interval: interval, name: name ?? "路线回放")
+        guard outcome.ok else {
+            throw LocServerError("回放启动失败：\(outcome.detail ?? "注入接口无响应")")
+        }
 
         return RoutePlayData(gpx: "",
                              pointsCount: points.count,
@@ -431,32 +434,48 @@ final class RoutePlayer {
     private(set) var playing = false
     private(set) var progress = 0
     private(set) var total = 0
+    /// 回放中途注入失败的原因，供界面提示
+    private(set) var failureText: String?
 
     private var task: Task<Void, Never>?
 
     private init() {}
 
-    func start(points: [GeoPoint], interval: TimeInterval, name: String?) {
+    @discardableResult
+    func start(points: [GeoPoint], interval: TimeInterval, name: String?) -> InjectionOutcome {
         stop()
-        guard !points.isEmpty else { return }
+        guard !points.isEmpty else {
+            return InjectionOutcome(ok: false, method: "none", detail: "没有可回放的点")
+        }
 
         let injector = NativeInjector.shared
+        // 首点先注入，失败直接把原因抛给调用方，避免「显示已开始回放但实际没动」
+        let first = injector.start(points[0].coordinate, accuracy: 25, name: name)
+        guard first.ok else { return first }
+
         playing = true
         total = points.count
-        progress = 0
+        progress = 1
 
         let step = max(0.05, interval)
+        let rest = Array(points.dropFirst())
         task = Task { @MainActor in
-            for (index, point) in points.enumerated() {
+            for (index, point) in rest.enumerated() {
                 if Task.isCancelled { return }
-                _ = injector.start(point.coordinate, accuracy: 25, name: name)
-                self.progress = index + 1
-                if index < points.count - 1 {
+                let outcome = injector.start(point.coordinate, accuracy: 25, name: name)
+                if !outcome.ok {
+                    self.failureText = outcome.detail ?? "回放中途注入失败"
+                    self.playing = false
+                    return
+                }
+                self.progress = index + 2
+                if index < rest.count - 1 {
                     try? await Task.sleep(nanoseconds: UInt64(step * 1_000_000_000))
                 }
             }
             self.playing = false
         }
+        return first
     }
 
     func stop() {
@@ -465,5 +484,6 @@ final class RoutePlayer {
         playing = false
         progress = 0
         total = 0
+        failureText = nil
     }
 }

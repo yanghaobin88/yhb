@@ -113,14 +113,15 @@ final class NativeInjector {
         }
         manager = instance
 
-        // 不同系统版本的方法名不完全一致，按优先级逐个试
-        let candidates: [(name: String, wantsAccuracy: Bool)] = [
-            ("startSimulatingLocationWithCoordinate:accuracy:", true),
-            ("startSimulatingLocationWithCoordinate:", false),
-            ("simulateLocation:accuracy:", true),
-            ("simulateLocation:", false),
-            ("setSimulatedLocation:", false),
-            ("setLocation:", false)
+        // 不同系统版本的方法名与参数形态都不一致，必须按参数类型分组：
+        // 坐标用两个 double（走浮点寄存器），对象参数走通用寄存器，混用会读到垃圾指针而崩溃。
+        enum StartShape { case coordinateWithAccuracy, coordinate, object }
+        let candidates: [(name: String, shape: StartShape)] = [
+            ("startSimulatingLocationWithCoordinate:accuracy:", .coordinateWithAccuracy),
+            ("startSimulatingLocationWithCoordinate:", .coordinate),
+            ("simulateLocation:accuracy:", .coordinateWithAccuracy),
+            ("simulateLocation:", .object),
+            ("setSimulatedLocation:", .object)
         ]
 
         for candidate in candidates {
@@ -129,17 +130,24 @@ final class NativeInjector {
             guard let imp = class_getMethodImplementation(type(of: instance), sel) else { continue }
 
             let target = instance
-            if candidate.wantsAccuracy {
+            switch candidate.shape {
+            case .coordinateWithAccuracy:
                 typealias StartWithAccuracy = @convention(c) (AnyObject, Selector, Double, Double, Double) -> Void
                 let fn = unsafeBitCast(imp, to: StartWithAccuracy.self)
                 startCall = { coordinate, accuracy in
                     fn(target, sel, coordinate.latitude, coordinate.longitude, accuracy)
                 }
-            } else {
+            case .coordinate:
                 typealias StartPlain = @convention(c) (AnyObject, Selector, Double, Double) -> Void
                 let fn = unsafeBitCast(imp, to: StartPlain.self)
                 startCall = { coordinate, _ in
                     fn(target, sel, coordinate.latitude, coordinate.longitude)
+                }
+            case .object:
+                typealias StartObject = @convention(c) (AnyObject, Selector, AnyObject) -> Void
+                let fn = unsafeBitCast(imp, to: StartObject.self)
+                startCall = { coordinate, accuracy in
+                    fn(target, sel, Self.makeLocation(coordinate, accuracy: accuracy))
                 }
             }
             resolvedStartSelector = candidate.name
@@ -250,6 +258,90 @@ final class NativeInjector {
                             logPath: nil)
     }
 
+    // MARK: - 自检（本机排障用）
+
+    /// 端到端自检：接口可用性 → 注入测试坐标 → CLLocationManager 回读比对 → 还原原状态。
+    /// 报告逐行可读，可直接贴给开发者定位失败点。
+    func diagnose(testPoint: CLLocationCoordinate2D = CLLocationCoordinate2D(latitude: 39.9042,
+                                                                            longitude: 116.4074),
+                  sampleTimeout: TimeInterval = 4) async -> (passed: Bool, report: String) {
+        var lines: [String] = []
+        var passed = false
+
+        lines.append("【注入自检】系统 \(ProcessInfo.processInfo.operatingSystemVersionString)")
+
+        guard let cls = NSClassFromString("CLSimulationManager") else {
+            classFound = false
+            probeReport = "系统里没有 CLSimulationManager（iOS 版本不支持本机注入）"
+            lines.append("1. 私有类：未找到，当前系统不支持本机注入")
+            return (false, lines.joined(separator: "\n"))
+        }
+        classFound = true
+        guard let instance = (manager ?? resolveManager(cls)) else {
+            lines.append("1. 私有类：已找到，但取不到实例")
+            return (false, lines.joined(separator: "\n"))
+        }
+        manager = instance
+        lines.append("1. 私有类：已找到实例")
+
+        let names = ["startLocationSimulation",
+                     "appendSimulatedLocation:",
+                     "flush",
+                     "stopLocationSimulation",
+                     "clearSimulatedLocations",
+                     "setLocationDeliveryBehavior:",
+                     "startSimulatingLocationWithCoordinate:accuracy:",
+                     "startSimulatingLocationWithCoordinate:",
+                     "stopSimulatingLocation"]
+        var availableNames: [String] = []
+        var missingNames: [String] = []
+        for name in names {
+            if instance.responds(to: NSSelectorFromString(name)) {
+                availableNames.append(name)
+            } else {
+                missingNames.append(name)
+            }
+        }
+        lines.append("2. 方法可用：\(availableNames.isEmpty ? "（无）" : availableNames.joined(separator: ", "))")
+        if !missingNames.isEmpty {
+            lines.append("   方法缺失：\(missingNames.joined(separator: ", "))")
+        }
+
+        let ready = available
+        lines.append("3. 通道：\(ready ? "已就绪，" + (resolvedStartSelector ?? "?") : "不可用，" + probeReport)")
+        guard ready else { return (false, lines.joined(separator: "\n")) }
+
+        let baselinePoint = activePoint
+        let baselineName = activeName
+        let targetText = String(format: "%.5f, %.5f", testPoint.latitude, testPoint.longitude)
+        let outcome = start(testPoint, accuracy: 25, name: "自检坐标")
+        lines.append("4. 注入测试坐标 \(targetText)：\(outcome.ok ? "调用成功" : "调用失败（\(outcome.detail ?? "-")）")")
+        guard outcome.ok else { return (false, lines.joined(separator: "\n")) }
+
+        try? await Task.sleep(nanoseconds: 700_000_000)
+        let sampled = await LocationProbe.shared.sample(timeout: sampleTimeout)
+        if let sampled {
+            let target = CLLocation(latitude: testPoint.latitude, longitude: testPoint.longitude)
+            let distance = sampled.distance(from: target)
+            let sampledText = String(format: "%.5f, %.5f", sampled.coordinate.latitude, sampled.coordinate.longitude)
+            lines.append("5. 系统采样：\(sampledText)，与目标差 \(Int(distance)) 米，精度 ±\(Int(max(0, sampled.horizontalAccuracy))) 米")
+            passed = distance <= 500
+            lines.append(passed
+                         ? "结论：注入生效，系统定位已被改写。"
+                         : "结论：采样与目标不符，注入被忽略 → 常见原因：非 TrollStore 安装、entitlements 未注入、定位授权被关闭。")
+        } else {
+            lines.append("5. 系统采样：超时未返回 → 检查系统定位服务与 App 定位权限")
+        }
+
+        // 还原自检前的状态，避免自检把用户设的坐标冲掉
+        if let baselinePoint {
+            _ = start(baselinePoint.coordinate, accuracy: 25, name: baselineName)
+        } else {
+            _ = stop()
+        }
+        return (passed, lines.joined(separator: "\n"))
+    }
+
     // MARK: - 旧通道（iOS 14–16）
 
     /// 配置 IOS 14–16 的旧注入通道：
@@ -290,13 +382,7 @@ final class NativeInjector {
                 beginFn(target, beginSel)
                 session.running = true
             }
-            let location = CLLocation(coordinate: coordinate,
-                                      altitude: 100,
-                                      horizontalAccuracy: max(1, accuracy),
-                                      verticalAccuracy: -1,
-                                      course: -1,
-                                      speed: -1,
-                                      timestamp: Date())
+            let location = Self.makeLocation(coordinate, accuracy: accuracy)
             appendFn(target, appendSel, location)
         }
 
@@ -313,6 +399,18 @@ final class NativeInjector {
     }
 
     // MARK: - 私有工具
+
+    /// 统一的模拟位置构造：时间戳取当前时刻，无效字段按苹果约定置 -1
+    nonisolated private static func makeLocation(_ coordinate: CLLocationCoordinate2D,
+                                                accuracy: Double) -> CLLocation {
+        CLLocation(coordinate: coordinate,
+                   altitude: 100,
+                   horizontalAccuracy: max(1, accuracy),
+                   verticalAccuracy: -1,
+                   course: -1,
+                   speed: -1,
+                   timestamp: Date())
+    }
 
     /// 取 CLSimulationManager 实例：defaultManager / sharedManager / alloc+init
     private func resolveManager(_ cls: AnyClass) -> AnyObject? {
