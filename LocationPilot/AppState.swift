@@ -233,7 +233,7 @@ final class AppState: ObservableObject {
                         level: .failure)
                 }
             }
-            await loadStatus(using: engine, silently: true)
+            _ = await loadStatus(using: engine, silently: true)
             return true
         } catch {
             health = nil
