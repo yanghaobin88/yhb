@@ -34,6 +34,10 @@ struct InjectView: View {
                     ResultBannerView(text: success, isError: false) { app.clearBanners() }
                 }
 
+                if let reason = app.nativeBlockReason {
+                    nativeBlockedNotice(reason)
+                }
+
                 coordinateCard
                 presetCard
                 favoriteQuickCard
@@ -246,6 +250,35 @@ struct InjectView: View {
                 }
             }
         }
+    }
+
+    // MARK: - 本机注入不可用提示
+
+    /// iOS 超出 TrollStore 支持区间时的常驻提示（不随错误横幅一起消失）
+    private func nativeBlockedNotice(_ reason: String) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 6) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.footnote)
+                    .foregroundStyle(.orange)
+                Text("本机注入不可用")
+                    .font(.footnote.weight(.semibold))
+            }
+            Text(reason)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Text(InjectorCompat.advice)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(Color.orange.opacity(0.12))
+        )
     }
 
     // MARK: - 设备状态卡

@@ -47,10 +47,25 @@ final class AppState: ObservableObject {
     /// 定位注入走哪条路：本机注入（默认，不需要电脑）或 Mac 桥接
     @Published var engineMode: EngineMode {
         didSet {
+            // 超出 TrollStore 支持区间的系统上，本机注入必然失败，这里直接拦回 Mac 桥接，
+            // 避免用户切过去后看到「注入成功」但定位一动不动。
+            if engineMode == .native && !InjectorCompat.isNativeCapable {
+                let reason = InjectorCompat.blockReason ?? "本机注入在当前系统不可用。"
+                engineMode = .remote
+                lastError = reason
+                log(reason, level: .failure)
+                return
+            }
             UserDefaults.standard.set(engineMode.rawValue, forKey: Keys.engineMode)
             log("注入模式已切换为：\(engineMode.label)", level: .info)
         }
     }
+
+    /// 本机注入被系统版本挡住时的原因；可用时为 nil
+    @Published private(set) var nativeBlockReason: String?
+
+    /// 当前系统能否使用本机注入
+    var nativeAvailable: Bool { InjectorCompat.isNativeCapable }
 
     // MARK: - 服务器配置
 
@@ -104,9 +119,20 @@ final class AppState: ObservableObject {
         let savedPort = defaults.string(forKey: Keys.port) ?? "8765"
         self.host = savedHost
         self.port = savedPort
-        self.engineMode = EngineMode(rawValue: defaults.string(forKey: Keys.engineMode) ?? "") ?? .native
+        let savedEngine = EngineMode(rawValue: defaults.string(forKey: Keys.engineMode) ?? "") ?? .native
+        let blocked = InjectorCompat.blockReason
+        self.nativeBlockReason = blocked
+        // 系统版本超出 TrollStore 支持区间时直接落到 Mac 桥接，不再让用户白试
+        self.engineMode = blocked == nil ? savedEngine : .remote
         loadFavorites()
-        log("App 已启动，服务器地址：\(baseAddressText)", level: .info)
+        log("App 已启动，运行模式：\(engineMode.label)，\(InjectorCompat.statusLine)", level: .info)
+        if let blocked {
+            log(blocked, level: .failure)
+            log(InjectorCompat.advice, level: .info)
+        } else if engineMode == .remote && baseURL == nil {
+            log("还没有配置 Mac 服务器地址。请在「设置」页填写 Mac 的局域网 IP，例如 192.168.1.5:8765。",
+                level: .info)
+        }
     }
 
     // MARK: - 派生属性
@@ -151,7 +177,11 @@ final class AppState: ObservableObject {
         switch connection {
         case .online: return "服务已连接，但未检测到 iPhone"
         case .offline(let reason): return reason
-        case .unknown: return "请先在设置中填写 Mac 服务器地址"
+        case .unknown:
+            if nativeAvailable {
+                return "请先在设置中填写 Mac 服务器地址"
+            }
+            return "iOS \(InjectorCompat.versionText) 需用 Mac 桥接：请填写 Mac 的 IP 与端口"
         }
     }
 

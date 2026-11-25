@@ -271,9 +271,11 @@ final class NativeInjector {
         let probe = LocationProbe.shared
 
         lines.append("【注入自检】系统 \(ProcessInfo.processInfo.operatingSystemVersionString)")
-        let version = ProcessInfo.processInfo.operatingSystemVersion
-        let trollStoreRange = version.majorVersion >= 14 && version.majorVersion <= 17
-        lines.append("0. 特权安装区间：\(trollStoreRange ? "在 TrollStore 支持范围内（14.0–17.0）" : "超出 TrollStore 支持范围（仅 14.0–17.0），本机注入基本不可能生效")")
+        lines.append("0. 特权安装区间：\(InjectorCompat.statusLine)")
+        if let reason = InjectorCompat.blockReason {
+            lines.append("   结论：\(reason)")
+            lines.append("   建议：\(InjectorCompat.advice)")
+        }
 
         guard let cls = NSClassFromString("CLSimulationManager") else {
             classFound = false

@@ -52,10 +52,32 @@ struct SettingsView: View {
         Section {
             Picker("注入方式", selection: $app.engineMode) {
                 ForEach(EngineMode.allCases) { mode in
-                    Text(mode.label).tag(mode)
+                    Text(mode == .native && !app.nativeAvailable
+                         ? "\(mode.label)（当前系统不可用）"
+                         : mode.label)
+                        .tag(mode)
                 }
             }
             .pickerStyle(.inline)
+
+            if let reason = app.nativeBlockReason {
+                VStack(alignment: .leading, spacing: 5) {
+                    HStack(alignment: .top, spacing: 6) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.caption2)
+                            .foregroundStyle(.orange)
+                            .padding(.top, 1)
+                        Text(reason)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Text(InjectorCompat.advice)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
 
             HStack(alignment: .top, spacing: 6) {
                 Image(systemName: app.engineMode.iconName)
