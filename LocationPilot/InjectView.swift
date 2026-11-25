@@ -50,7 +50,7 @@ struct InjectView: View {
                 Task { await app.loadPresets() }
             }
         }
-        .onChange(of: app.pickedPoint) { _, newValue in
+        .onChange(of: app.pickedPoint) { newValue in
             if let point = newValue {
                 applyText(point)
             }

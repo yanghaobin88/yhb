@@ -35,7 +35,7 @@ struct SettingsView: View {
             logSection
             aboutSection
         }
-        .onChange(of: app.engineMode) { _, _ in
+        .onChange(of: app.engineMode) { _ in
             Task { await app.bootstrap() }
         }
         .onAppear {

@@ -8,14 +8,20 @@
 import SwiftUI
 import MapKit
 import CoreLocation
+import UIKit
 
 struct MapPickView: View {
     @EnvironmentObject private var app: AppState
 
-    @State private var cameraPosition: MapCameraPosition = .region(
-        MKCoordinateRegion(center: CLLocationCoordinate2D(latitude: 39.908722, longitude: 116.397499),
-                           span: MKCoordinateSpan(latitudeDelta: 0.08, longitudeDelta: 0.08))
-    )
+    /// 地图聚焦请求：token 变化时才移动视野
+    fileprivate struct MapFocus: Equatable {
+        let center: CLLocationCoordinate2D
+        let span: Double
+        let token: UUID
+        static func == (lhs: MapFocus, rhs: MapFocus) -> Bool { lhs.token == rhs.token }
+    }
+
+    @State private var focusRequest: MapFocus?
     @State private var showSearchSheet = false
     @State private var showFavoriteSheet = false
     @State private var favoriteName = ""
@@ -48,49 +54,32 @@ struct MapPickView: View {
     // MARK: - 地图
 
     private var mapLayer: some View {
-        MapReader { proxy in
-            Map(position: $cameraPosition, interactionModes: [.pan, .zoom]) {
-                if let point = currentPoint {
-                    Annotation("当前选点", coordinate: point.coordinate) {
-                        ZStack {
-                            Circle()
-                                .fill(Color.red.opacity(0.20))
-                                .frame(width: 34, height: 34)
-                            Circle()
-                                .fill(Color.red)
-                                .frame(width: 12, height: 12)
-                                .overlay(Circle().stroke(Color.white, lineWidth: 2))
-                        }
-                    }
-                }
-
-                if let start = app.routeStart {
-                    Marker("起点", systemImage: "flag.fill", coordinate: start.coordinate)
-                        .tint(.green)
-                }
-
-                if let end = app.routeEnd {
-                    Marker("终点", systemImage: "flag.checkered", coordinate: end.coordinate)
-                        .tint(.orange)
-                }
-
-                if let route = app.routes.first, route.points.count >= 2 {
-                    MapPolyline(coordinates: route.points.map { $0.coordinate })
-                        .stroke(Color.accentColor.opacity(0.75), lineWidth: 4)
-                } else if let start = app.routeStart, let end = app.routeEnd {
-                    MapPolyline(coordinates: [start.coordinate, end.coordinate])
-                        .stroke(Color.gray.opacity(0.6), style: StrokeStyle(lineWidth: 2, dash: [6, 5]))
-                }
-            }
-            .mapStyle(.standard(elevation: .flat, pointsOfInterest: .including([.cafe, .restaurant, .park, .publicTransport])))
-            .onTapGesture { screenPoint in
-                if let coordinate = proxy.convert(screenPoint, from: .local) {
-                    app.pickedPoint = GeoPoint(coordinate)
-                    app.log("地图选点：\(GeoPoint(coordinate).text)", level: .info)
-                }
-            }
+        MapCanvas(point: currentPoint,
+                  start: app.routeStart,
+                  end: app.routeEnd,
+                  route: routeCoordinates,
+                  routeDashed: routeIsPreview,
+                  focus: focusRequest) { coordinate in
+            app.pickedPoint = GeoPoint(coordinate)
+            app.log("地图选点：\(GeoPoint(coordinate).text)", level: .info)
         }
         .ignoresSafeArea(edges: .bottom)
+    }
+
+    /// 已规划路线的坐标；没有路线时退回起终点直线
+    private var routeCoordinates: [CLLocationCoordinate2D] {
+        if let route = app.routes.first, route.points.count >= 2 {
+            return route.points.map { $0.coordinate }
+        }
+        if let start = app.routeStart, let end = app.routeEnd {
+            return [start.coordinate, end.coordinate]
+        }
+        return []
+    }
+
+    /// 没有真实规划结果时用虚线示意
+    private var routeIsPreview: Bool {
+        return (app.routes.first?.points.count ?? 0) < 2
     }
 
     // MARK: - 底部操作条
@@ -239,11 +228,142 @@ struct MapPickView: View {
     }
 
     private func focus(on point: GeoPoint, zoom: Double) {
-        withAnimation(.easeInOut(duration: 0.35)) {
-            cameraPosition = .region(
-                MKCoordinateRegion(center: point.coordinate,
-                                   span: MKCoordinateSpan(latitudeDelta: zoom, longitudeDelta: zoom))
-            )
+        focusRequest = MapFocus(center: point.coordinate, span: zoom, token: UUID())
+    }
+}
+
+// MARK: - 地图画布（MKMapView 包装，兼容 iOS 16）
+
+/// 单个标注：用颜色和图标区分选点 / 起点 / 终点
+private final class PilotAnnotation: NSObject, MKAnnotation {
+    let title: String?
+    let tint: UIColor
+    let glyph: String
+    @objc dynamic var coordinate: CLLocationCoordinate2D
+
+    init(title: String, coordinate: CLLocationCoordinate2D, tint: UIColor, glyph: String) {
+        self.title = title
+        self.coordinate = coordinate
+        self.tint = tint
+        self.glyph = glyph
+    }
+}
+
+private struct MapCanvas: UIViewRepresentable {
+    var point: GeoPoint?
+    var start: GeoPoint?
+    var end: GeoPoint?
+    var route: [CLLocationCoordinate2D]
+    var routeDashed: Bool
+    var focus: MapPickView.MapFocus?
+    var onTap: (CLLocationCoordinate2D) -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    func makeUIView(context: Context) -> MKMapView {
+        let map = MKMapView()
+        map.delegate = context.coordinator
+        map.showsCompass = true
+        map.pointOfInterestFilter = .includingAll
+        map.setRegion(MKCoordinateRegion(center: CLLocationCoordinate2D(latitude: 39.908722, longitude: 116.397499),
+                                         span: MKCoordinateSpan(latitudeDelta: 0.08, longitudeDelta: 0.08)),
+                      animated: false)
+        let tap = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handleTap(_:)))
+        map.addGestureRecognizer(tap)
+        context.coordinator.mapView = map
+        return map
+    }
+
+    func updateUIView(_ map: MKMapView, context: Context) {
+        let coordinator = context.coordinator
+        coordinator.parent = self
+
+        // 标注
+        var desired: [(String, CLLocationCoordinate2D, UIColor, String)] = []
+        if let point = point {
+            desired.append(("当前选点", point.coordinate, .systemRed, "mappin"))
+        }
+        if let start = start {
+            desired.append(("起点", start.coordinate, .systemGreen, "flag.fill"))
+        }
+        if let end = end {
+            desired.append(("终点", end.coordinate, .systemOrange, "flag.checkered"))
+        }
+        let annoSignature = desired
+            .map { "\($0.0)@\($0.1.latitude),\($0.1.longitude)" }
+            .joined(separator: ";")
+        if coordinator.lastAnnotationSignature != annoSignature {
+            coordinator.lastAnnotationSignature = annoSignature
+            map.removeAnnotations(map.annotations.compactMap { $0 as? PilotAnnotation })
+            for item in desired {
+                map.addAnnotation(PilotAnnotation(title: item.0, coordinate: item.1, tint: item.2, glyph: item.3))
+            }
+        }
+
+        // 路线
+        let routeSignature = "\(route.count)|\(route.first?.latitude ?? 0),\(route.first?.longitude ?? 0)|\(route.last?.latitude ?? 0),\(route.last?.longitude ?? 0)|\(routeDashed)"
+        if coordinator.lastRouteSignature != routeSignature {
+            coordinator.lastRouteSignature = routeSignature
+            map.removeOverlays(map.overlays)
+            if route.count >= 2 {
+                let line = MKPolyline(coordinates: route, count: route.count)
+                map.addOverlay(line, level: .aboveRoads)
+            }
+        }
+
+        // 视野
+        if let focus = focus, coordinator.lastFocusToken != focus.token {
+            coordinator.lastFocusToken = focus.token
+            map.setRegion(MKCoordinateRegion(center: focus.center,
+                                             span: MKCoordinateSpan(latitudeDelta: focus.span, longitudeDelta: focus.span)),
+                          animated: true)
+        }
+    }
+
+    final class Coordinator: NSObject, MKMapViewDelegate {
+        var parent: MapCanvas
+        weak var mapView: MKMapView?
+        var lastAnnotationSignature = ""
+        var lastRouteSignature = ""
+        var lastFocusToken: UUID?
+
+        init(_ parent: MapCanvas) { self.parent = parent }
+
+        @objc func handleTap(_ gesture: UITapGestureRecognizer) {
+            guard let map = mapView else { return }
+            let screen = gesture.location(in: map)
+            let coordinate = map.convert(screen, toCoordinateFrom: map)
+            parent.onTap(coordinate)
+        }
+
+        func mapView(_ mapView: MKMapView, viewFor annotation: MKAnnotation) -> MKAnnotationView? {
+            guard let pilot = annotation as? PilotAnnotation else { return nil }
+            let identifier = "pilot"
+            var view = mapView.dequeueReusableAnnotationView(withIdentifier: identifier) as? MKMarkerAnnotationView
+            if view == nil {
+                view = MKMarkerAnnotationView(annotation: pilot, reuseIdentifier: identifier)
+            }
+            view?.annotation = pilot
+            view?.markerTintColor = pilot.tint
+            view?.glyphImage = UIImage(systemName: pilot.glyph)
+            view?.displayPriority = .required
+            return view
+        }
+
+        func mapView(_ mapView: MKMapView, rendererFor overlay: MKOverlay) -> MKOverlayRenderer {
+            guard let line = overlay as? MKPolyline else {
+                return MKOverlayRenderer(overlay: overlay)
+            }
+            let renderer = MKPolylineRenderer(polyline: line)
+            if parent.routeDashed {
+                renderer.strokeColor = UIColor.systemGray.withAlphaComponent(0.85)
+                renderer.lineWidth = 2
+                renderer.lineDashPattern = [6, 5]
+            } else {
+                renderer.strokeColor = UIColor.systemBlue.withAlphaComponent(0.80)
+                renderer.lineWidth = 4
+            }
+            return renderer
         }
     }
 }
