@@ -6,10 +6,18 @@
 //  彻底去掉「手机 App → Mac locserver.py」的桥接。
 //
 //  调用链（全部走 objc runtime，不依赖任何私有头文件）：
+//  新通道（iOS 17+）：
 //      CLSimulationManager
 //        + defaultManager
 //        - startSimulatingLocationWithCoordinate:accuracy:
 //        - stopSimulatingLocation
+//        - flush
+//  旧通道（iOS 14–16，iOS 16.6 实测可用）：
+//        - startLocationSimulation
+//        - appendSimulatedLocation:   （参数是 CLLocation*）
+//        - flush
+//        - stopLocationSimulation
+//        - clearSimulatedLocations
 //
 //  前提：App 必须持有 com.apple.locationd.simulation 权限。
 //  用 TrollStore 安装（ldid -S 注入 entitlements）时该权限生效；
@@ -26,6 +34,11 @@ struct InjectionOutcome {
     /// 命中的私有方法名，便于排查不同 iOS 版本的差异
     let method: String
     let detail: String?
+}
+
+/// 旧通道的会话状态（闭包之间共享「是否已开始模拟」）
+private final class LegacySession {
+    var running = false
 }
 
 /// 本机定位注入器
@@ -50,6 +63,8 @@ final class NativeInjector {
     private(set) var classFound = false
     /// 命中的启动方法名
     private(set) var resolvedStartSelector: String?
+    /// 命中的停止方法名
+    private(set) var resolvedStopSelector: String?
 
     // MARK: - 私有句柄
 
@@ -131,22 +146,30 @@ final class NativeInjector {
             break
         }
 
+        // 新通道没有启动方法时，退回 iOS 14–16 的旧通道
+        if startCall == nil {
+            setupLegacyChannel(instance)
+        }
+
         guard startCall != nil else {
             let names = candidateSelectors(of: instance)
-            probeReport = "CLSimulationManager 实例在，但没有可用的启动方法。已暴露方法：\(names)"
+            probeReport = "CLSimulationManager 实例在，但新/旧两套方法都不可用。已暴露方法：\(names)"
             return false
         }
 
-        // 停止方法
-        for name in ["stopSimulatingLocation", "clearSimulatedLocation", "stopSimulation"] {
-            let sel = NSSelectorFromString(name)
-            guard instance.responds(to: sel) else { continue }
-            guard let imp = class_getMethodImplementation(type(of: instance), sel) else { continue }
-            typealias Stop = @convention(c) (AnyObject, Selector) -> Void
-            let fn = unsafeBitCast(imp, to: Stop.self)
-            let target = instance
-            stopCall = { fn(target, sel) }
-            break
+        // 停止方法（旧通道已在 setupLegacyChannel 里配好）
+        if stopCall == nil {
+            for name in ["stopSimulatingLocation", "clearSimulatedLocation", "stopSimulation"] {
+                let sel = NSSelectorFromString(name)
+                guard instance.responds(to: sel) else { continue }
+                guard let imp = class_getMethodImplementation(type(of: instance), sel) else { continue }
+                typealias Stop = @convention(c) (AnyObject, Selector) -> Void
+                let fn = unsafeBitCast(imp, to: Stop.self)
+                let target = instance
+                stopCall = { fn(target, sel) }
+                resolvedStopSelector = name
+                break
+            }
         }
 
         // 落地方法
@@ -197,7 +220,7 @@ final class NativeInjector {
             activePoint = nil
             activeName = nil
             return InjectionOutcome(ok: stopCall != nil,
-                                    method: "stopSimulatingLocation",
+                                    method: resolvedStopSelector ?? "stopSimulatingLocation",
                                     detail: stopCall == nil ? "系统没有提供停止方法，重启定位服务后恢复" : nil)
         }
         call()
@@ -205,7 +228,7 @@ final class NativeInjector {
         injected = false
         activePoint = nil
         activeName = nil
-        return InjectionOutcome(ok: true, method: "stopSimulatingLocation", detail: nil)
+        return InjectionOutcome(ok: true, method: resolvedStopSelector ?? "stopSimulatingLocation", detail: nil)
     }
 
     /// 生成一份会话状态，喂给界面上的「会话」区块
@@ -225,6 +248,68 @@ final class NativeInjector {
                             pid: nil,
                             stateText: text,
                             logPath: nil)
+    }
+
+    // MARK: - 旧通道（iOS 14–16）
+
+    /// 配置 IOS 14–16 的旧注入通道：
+    /// `startLocationSimulation` 开一次会话，`appendSimulatedLocation:` 逐个投递 CLLocation。
+    private func setupLegacyChannel(_ instance: AnyObject) {
+        let cls: AnyClass = type(of: instance)
+        let beginSel = NSSelectorFromString("startLocationSimulation")
+        let appendSel = NSSelectorFromString("appendSimulatedLocation:")
+        guard instance.responds(to: beginSel),
+              instance.responds(to: appendSel),
+              let beginIMP = class_getMethodImplementation(cls, beginSel),
+              let appendIMP = class_getMethodImplementation(cls, appendSel) else { return }
+
+        typealias NoArgument = @convention(c) (AnyObject, Selector) -> Void
+        typealias OneObject = @convention(c) (AnyObject, Selector, AnyObject) -> Void
+
+        let beginFn = unsafeBitCast(beginIMP, to: NoArgument.self)
+        let appendFn = unsafeBitCast(appendIMP, to: OneObject.self)
+        let target = instance
+        let session = LegacySession()
+
+        var endCall: (() -> Void)?
+        let endSel = NSSelectorFromString("stopLocationSimulation")
+        if instance.responds(to: endSel), let imp = class_getMethodImplementation(cls, endSel) {
+            let fn = unsafeBitCast(imp, to: NoArgument.self)
+            endCall = { fn(target, endSel) }
+        }
+
+        var clearCall: (() -> Void)?
+        let clearSel = NSSelectorFromString("clearSimulatedLocations")
+        if instance.responds(to: clearSel), let imp = class_getMethodImplementation(cls, clearSel) {
+            let fn = unsafeBitCast(imp, to: NoArgument.self)
+            clearCall = { fn(target, clearSel) }
+        }
+
+        startCall = { coordinate, accuracy in
+            if !session.running {
+                beginFn(target, beginSel)
+                session.running = true
+            }
+            let location = CLLocation(coordinate: coordinate,
+                                      altitude: 100,
+                                      horizontalAccuracy: max(1, accuracy),
+                                      verticalAccuracy: -1,
+                                      course: -1,
+                                      speed: -1,
+                                      timestamp: Date())
+            appendFn(target, appendSel, location)
+        }
+
+        stopCall = {
+            if session.running {
+                endCall?()
+                session.running = false
+            }
+            clearCall?()
+        }
+
+        resolvedStartSelector = "startLocationSimulation + appendSimulatedLocation:"
+        resolvedStopSelector = "stopLocationSimulation + clearSimulatedLocations"
     }
 
     // MARK: - 私有工具
