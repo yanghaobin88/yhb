@@ -26,6 +26,7 @@
 
 import Foundation
 import CoreLocation
+import Darwin
 import ObjectiveC
 
 /// 一次注入调用的结果
@@ -260,15 +261,19 @@ final class NativeInjector {
 
     // MARK: - 自检（本机排障用）
 
-    /// 端到端自检：接口可用性 → 注入测试坐标 → CLLocationManager 回读比对 → 还原原状态。
-    /// 报告逐行可读，可直接贴给开发者定位失败点。
+    /// 端到端自检：接口可用性 → 权限 → 注入前基线 → 注入测试坐标 → 回读比对 → 还原原状态。
+    /// 报告逐行可读，能区分「方法缺失 / 写入被忽略 / 权限不足 / 系统不回调」四类原因。
     func diagnose(testPoint: CLLocationCoordinate2D = CLLocationCoordinate2D(latitude: 39.9042,
                                                                             longitude: 116.4074),
                   sampleTimeout: TimeInterval = 4) async -> (passed: Bool, report: String) {
         var lines: [String] = []
         var passed = false
+        let probe = LocationProbe.shared
 
         lines.append("【注入自检】系统 \(ProcessInfo.processInfo.operatingSystemVersionString)")
+        let version = ProcessInfo.processInfo.operatingSystemVersion
+        let trollStoreRange = version.majorVersion >= 14 && version.majorVersion <= 17
+        lines.append("0. 特权安装区间：\(trollStoreRange ? "在 TrollStore 支持范围内（14.0–17.0）" : "超出 TrollStore 支持范围（仅 14.0–17.0），本机注入基本不可能生效")")
 
         guard let cls = NSClassFromString("CLSimulationManager") else {
             classFound = false
@@ -309,37 +314,106 @@ final class NativeInjector {
 
         let ready = available
         lines.append("3. 通道：\(ready ? "已就绪，" + (resolvedStartSelector ?? "?") : "不可用，" + probeReport)")
+        lines.append("3.1 定位权限：\(probe.authorizationText)")
+
         guard ready else { return (false, lines.joined(separator: "\n")) }
+
+        let entitlement = Self.simulationEntitlementState()
+        switch entitlement {
+        case .some(true):
+            lines.append("3.2 注入权限：已具备 com.apple.locationd.simulation")
+        case .some(false):
+            lines.append("3.2 注入权限：缺失 → 当前安装方式没注入该权限，私有接口调用会被系统静默丢弃（需 TrollStore 安装）")
+        case .none:
+            lines.append("3.2 注入权限：读不到（SecTask 符号不可用），跳过此项")
+        }
+
+        // 注入前基线：先看系统此刻报什么位置，才能判断后面「没变」还是「变了」
+        if let before = await probe.sample(timeout: 3, allowCached: true) {
+            lines.append("3.3 注入前定位：\(Self.describe(before))")
+        } else {
+            lines.append("3.3 注入前定位：取不到（权限未开启或系统未回调）")
+        }
 
         let baselinePoint = activePoint
         let baselineName = activeName
         let targetText = String(format: "%.5f, %.5f", testPoint.latitude, testPoint.longitude)
         let outcome = start(testPoint, accuracy: 25, name: "自检坐标")
-        lines.append("4. 注入测试坐标 \(targetText)：\(outcome.ok ? "调用成功" : "调用失败（\(outcome.detail ?? "-")）")")
-        guard outcome.ok else { return (false, lines.joined(separator: "\n")) }
-
-        try? await Task.sleep(nanoseconds: 700_000_000)
-        let sampled = await LocationProbe.shared.sample(timeout: sampleTimeout)
-        if let sampled {
-            let target = CLLocation(latitude: testPoint.latitude, longitude: testPoint.longitude)
-            let distance = sampled.distance(from: target)
-            let sampledText = String(format: "%.5f, %.5f", sampled.coordinate.latitude, sampled.coordinate.longitude)
-            lines.append("5. 系统采样：\(sampledText)，与目标差 \(Int(distance)) 米，精度 ±\(Int(max(0, sampled.horizontalAccuracy))) 米")
-            passed = distance <= 500
-            lines.append(passed
-                         ? "结论：注入生效，系统定位已被改写。"
-                         : "结论：采样与目标不符，注入被忽略 → 常见原因：非 TrollStore 安装、entitlements 未注入、定位授权被关闭。")
-        } else {
-            lines.append("5. 系统采样：超时未返回 → 检查系统定位服务与 App 定位权限")
+        lines.append("4. 注入测试坐标 \(targetText)：\(outcome.ok ? "调用成功（\(outcome.method)）" : "调用失败（\(outcome.detail ?? "-")）")")
+        guard outcome.ok else {
+            restoreAfterDiagnose(baselinePoint, name: baselineName)
+            return (false, lines.joined(separator: "\n"))
         }
 
-        // 还原自检前的状态，避免自检把用户设的坐标冲掉
-        if let baselinePoint {
-            _ = start(baselinePoint.coordinate, accuracy: 25, name: baselineName)
+        try? await Task.sleep(nanoseconds: 1_200_000_000)
+        let after = await probe.sample(timeout: sampleTimeout)
+
+        if let after {
+            let target = CLLocation(latitude: testPoint.latitude, longitude: testPoint.longitude)
+            let distance = after.distance(from: target)
+            lines.append("5. 注入后定位：\(Self.describe(after))，与目标差 \(Int(distance)) 米")
+            if distance <= 500 {
+                passed = true
+                lines.append("结论：注入生效，系统定位已改写。")
+            } else {
+                var tail: String
+                if entitlement == false {
+                    tail = "结论：注入被忽略，原因已定位 —— 本 App 二进制没有 com.apple.locationd.simulation 权限（当前不是 TrollStore 安装），私有接口调用被系统直接丢弃，改代码无用。"
+                } else {
+                    tail = "结论：注入被忽略，系统仍报原位置。常见原因：entry 权限被签名剥离、只有模糊位置权限、当前 iOS 版本已封堵该私有接口。"
+                }
+                if let baseline = await probe.sample(timeout: 2, allowCached: true),
+                   after.distance(from: baseline) < 30 {
+                    tail += "（注入前后坐标几乎相同，写入确实没生效）"
+                }
+                lines.append(tail)
+            }
+        } else {
+            lines.append("5. 注入后定位：系统未回调，权限=\(probe.authorizationText)")
+            lines.append(probe.isAuthorized
+                         ? "结论：权限已开但系统不返回定位，无法回读验证。请打开系统「地图」App 看蓝点是否已落在测试坐标：已落则为生效，仍在本机则为写入被忽略。"
+                         : "结论：定位权限不可用，先在 设置 > 隐私与安全性 > 定位服务 里给本 App「使用 App 期间」并打开精确位置后重测。")
+        }
+
+        restoreAfterDiagnose(baselinePoint, name: baselineName)
+        return (passed, lines.joined(separator: "\n"))
+    }
+
+    /// 自检结束后把用户原本的坐标放回去，避免自检把模拟位置冲掉
+    private func restoreAfterDiagnose(_ point: GeoPoint?, name: String?) {
+        if let point {
+            _ = start(point.coordinate, accuracy: 25, name: name)
         } else {
             _ = stop()
         }
-        return (passed, lines.joined(separator: "\n"))
+    }
+
+    /// 读本 App 二进制里的 com.apple.locationd.simulation 权限。
+    /// 只有 TrollStore（或已越狱环境）安装才会带上它；普通签名缺失时私有接口调用成功但系统不采纳。
+    /// 用 dlsym 取私有 SecTask 符号，取不到时返回 nil 表示无法判断。
+    private static func simulationEntitlementState() -> Bool? {
+        typealias CreateFn = @convention(c) (CFAllocator?) -> Unmanaged<CFTypeRef>?
+        typealias CopyFn = @convention(c) (CFTypeRef, CFString, UnsafeMutablePointer<Unmanaged<CFError>?>?) -> Unmanaged<CFTypeRef>?
+
+        guard let handle = dlopen("/System/Library/Frameworks/Security.framework/Security", RTLD_NOW),
+              let createPtr = dlsym(handle, "SecTaskCreateFromSelf"),
+              let copyPtr = dlsym(handle, "SecTaskCopyValueForEntitlement") else { return nil }
+        let create = unsafeBitCast(createPtr, to: CreateFn.self)
+        let copy = unsafeBitCast(copyPtr, to: CopyFn.self)
+        guard let task = create(kCFAllocatorDefault)?.takeRetainedValue() else { return nil }
+        var error: Unmanaged<CFError>?
+        guard let value = copy(task, "com.apple.locationd.simulation" as CFString, &error)?.takeRetainedValue() else {
+            if let error { _ = error.takeRetainedValue() }
+            return false
+        }
+        if let number = value as? NSNumber { return number.boolValue }
+        return true
+    }
+
+    /// 采样结果的一行文字描述
+    private static func describe(_ location: CLLocation) -> String {
+        let accuracy = Int(max(0, location.horizontalAccuracy))
+        return String(format: "%.5f, %.5f · 精度±%d 米", location.coordinate.latitude, location.coordinate.longitude, accuracy)
     }
 
     // MARK: - 旧通道（iOS 14–16）
@@ -473,22 +547,62 @@ final class LocationProbe: NSObject, CLLocationManagerDelegate, @unchecked Senda
         manager.delegate = self
         manager.desiredAccuracy = kCLLocationAccuracyHundredMeters
         manager.distanceFilter = kCLDistanceFilterNone
+        // 不被系统自动挂起，否则回读采样会偶发收不到回调
+        manager.pausesLocationUpdatesAutomatically = false
+    }
+
+    /// 当前定位权限的文字描述，自检报告里用来排除权限因素
+    var authorizationText: String {
+        let statusText: String
+        switch manager.authorizationStatus {
+        case .notDetermined: statusText = "未询问"
+        case .restricted: statusText = "受限"
+        case .denied: statusText = "已拒绝"
+        case .authorizedAlways: statusText = "始终允许"
+        case .authorizedWhenInUse: statusText = "使用期间允许"
+        @unknown default: statusText = "未知状态"
+        }
+        let accuracyText = (manager.accuracyAuthorization == .fullAccuracy) ? "精确位置" : "模糊位置"
+        return "\(statusText) · \(accuracyText)"
+    }
+
+    /// 是否已获得定位授权
+    var isAuthorized: Bool {
+        switch manager.authorizationStatus {
+        case .authorizedAlways, .authorizedWhenInUse: return true
+        default: return false
+        }
     }
 
     /// 采一次系统当前定位，超时返回 nil
-    func sample(timeout: TimeInterval = 4) async -> CLLocation? {
+    /// - Parameter allowCached: 为 true 时优先用 5 分钟内的缓存值，避免为拿基线干等超时
+    func sample(timeout: TimeInterval = 4, allowCached: Bool = false) async -> CLLocation? {
         if manager.authorizationStatus == .notDetermined {
             await MainActor.run { self.manager.requestWhenInUseAuthorization() }
             // 给用户一点时间点授权弹窗
-            try? await Task.sleep(nanoseconds: 800_000_000)
+            try? await Task.sleep(nanoseconds: 1_200_000_000)
+        }
+        if allowCached, let cached = manager.location,
+           abs(cached.timestamp.timeIntervalSinceNow) < 300 {
+            return cached
+        }
+        if !isAuthorized {
+            // 没有权限时干等只会白等 4 秒，直接给缓存值（可能为 nil）
+            return manager.location
         }
         return await withCheckedContinuation { continuation in
             DispatchQueue.main.async {
                 self.latest = nil
                 self.waiter = continuation
                 self.manager.startUpdatingLocation()
+                // 第一轮等待；没回调就重启一次定位再等，避开系统首帧偶发不投递
                 DispatchQueue.main.asyncAfter(deadline: .now() + timeout) {
-                    self.finish(self.latest ?? self.manager.location)
+                    guard self.waiter != nil else { return }
+                    self.manager.stopUpdatingLocation()
+                    self.manager.startUpdatingLocation()
+                    DispatchQueue.main.asyncAfter(deadline: .now() + timeout) {
+                        self.finish(self.latest ?? self.manager.location)
+                    }
                 }
             }
         }
